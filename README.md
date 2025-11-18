@@ -1,7 +1,7 @@
 <div align="center">
 
-![mdnice](https://s2.loli.net/2025/11/18/xzuPwHCoDiET5r6.jpg)
-[![PyPI version](https://badge.fury.io/py/mdnice.svg)](https://badge.fury.io/py/mdnice) [![Python Version](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://pypi.org/project/mdnice/) [![Selenium](https://img.shields.io/badge/selenium-4.6%2B-green.svg)](https://www.selenium.dev/) [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE) 
+![mdnice](images/mdnice.jpg)
+[![PyPI version](https://badge.fury.io/py/mdnice.svg)](https://badge.fury.io/py/mdnice) [![Python Version](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://pypi.org/project/mdnice/) [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE) 
 
 </div>
 
