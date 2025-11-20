@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "mdnice"
-version = "0.0.1"
-description = "将 Markdown 转换为微信公众号、知乎、稀土掘金支持的富文本格式"
+version = "0.0.2"
+description = "🎈 将 Markdown 转换为微信公众号、知乎、稀土掘金支持的富文本格式"
 authors = ["xiaoqiang <xiaoqiangclub@hotmail.com>"]
 license = "Apache-2.0"
 readme = "README.md"
