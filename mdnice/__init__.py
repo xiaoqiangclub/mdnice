@@ -5,26 +5,9 @@
 # 文件路径：mdnice/__init__.py
 
 """
-快速开始:
-    >>> from mdnice import to_wechat, to_zhihu, to_juejin
-    >>> html = to_wechat('article.md', theme='rose')
-    >>> html = to_zhihu('article.md', theme='geekBlack')
-    >>> html = to_juejin('article.md', theme='scienceBlue')
+mdnice - Markdown 多平台格式转换工具
 
-通用转换:
-    >>> from mdnice import convert
-    >>> html = convert('article.md', platform='wechat')
-
-图片上传:
-    >>> def my_uploader(image_path: str) -> str:
-    >>>     # 上传逻辑
-    >>>     return "https://cdn.example.com/image.png"
-    >>>
-    >>> html = to_wechat(
-    >>>     'article.md',
-    >>>     image_uploader=my_uploader,
-    >>>     image_upload_mode='local'  # 只上传本地图片
-    >>> )
+支持转换为微信公众号、知乎、稀土掘金格式，支持本地浏览器和远程浏览器。
 """
 
 # 导入版本信息
@@ -48,10 +31,13 @@ from .image_uploaders import (
     UpyunUploader,
     GitHubUploader,
     LocalStorageUploader,
+    WechatUploader,
+    WechatUploadType,
     create_smms_uploader,
     create_qiniu_uploader,
     create_github_uploader,
     create_local_uploader,
+    create_wechat_uploader,
 )
 
 import os
@@ -60,14 +46,8 @@ import time
 import random
 from pathlib import Path
 from urllib.parse import urlparse
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException
+from playwright.sync_api import sync_playwright, Browser, Page, Playwright, TimeoutError as PlaywrightTimeoutError
 from typing import Union, List, Optional, Callable, Dict, Any, Literal
-
 
 __all__ = [
     'convert',
@@ -77,6 +57,9 @@ __all__ = [
     'MarkdownConverter',
     'ConversionError',
     'ImageUploadMode',
+    'CodeTheme',
+    'BrowserType',
+    'BrowserConnectionType',
     '__version__',
     # 图床上传器类
     'SMUploader',
@@ -87,16 +70,21 @@ __all__ = [
     'UpyunUploader',
     'GitHubUploader',
     'LocalStorageUploader',
+    'WechatUploader',
+    'WechatUploadType',
     # 便捷函数
     'create_smms_uploader',
     'create_qiniu_uploader',
     'create_github_uploader',
     'create_local_uploader',
+    'create_wechat_uploader',
 ]
-
 
 Platform = Literal['wechat', 'zhihu', 'juejin']
 ImageUploadMode = Literal['local', 'remote', 'all']
+CodeTheme = Literal['wechat', 'atom-one-dark', 'atom-one-light', 'monokai', 'github', 'vs2015', 'xcode']
+BrowserType = Literal['chromium', 'firefox', 'webkit']
+BrowserConnectionType = Literal['auto', 'cdp', 'playwright']
 
 
 class ConversionError(Exception):
@@ -124,42 +112,80 @@ class MarkdownConverter:
         'red': '红绯', 'blue': '蓝莹', 'scienceBlue': '科技蓝', 'simple': '简'
     }
 
+    AVAILABLE_CODE_THEMES = [
+        'wechat', 'atom-one-dark', 'atom-one-light',
+        'monokai', 'github', 'vs2015', 'xcode'
+    ]
+
+    CODE_THEME_CONFIG = {
+        'wechat': {'id': 'nice-menu-codetheme-wechat', 'name': '微信代码主题'},
+        'atom-one-dark': {'id': 'nice-menu-codetheme-atomOneDark', 'name': 'Atom One Dark'},
+        'atom-one-light': {'id': 'nice-menu-codetheme-atomOneLight', 'name': 'Atom One Light'},
+        'monokai': {'id': 'nice-menu-codetheme-monokai', 'name': 'Monokai'},
+        'github': {'id': 'nice-menu-codetheme-github', 'name': 'GitHub'},
+        'vs2015': {'id': 'nice-menu-codetheme-vs2015', 'name': 'VS2015'},
+        'xcode': {'id': 'nice-menu-codetheme-xcode', 'name': 'Xcode'}
+    }
+
     PLATFORM_CONFIG = {
         'wechat': {'button_id': 'nice-sidebar-wechat', 'name': '微信公众号', 'suffix': 'wechat'},
         'zhihu': {'button_id': 'nice-sidebar-zhihu', 'name': '知乎', 'suffix': 'zhihu'},
         'juejin': {'button_id': 'nice-sidebar-juejin', 'name': '稀土掘金', 'suffix': 'juejin'}
     }
 
-
     def __init__(self,
-                headless: bool = True,
-                wait_timeout: int = 30,
-                retry_count: int = 1,
-                on_error: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-                editor_url: Optional[str] = None,
-                image_uploader: Optional[Callable[[str], str]] = None,
-                image_upload_mode: ImageUploadMode = 'local',
-                chromedriver_path: Optional[str] = None) -> None:  # 新增参数
+                 headless: bool = True,
+                 wait_timeout: int = 30,
+                 retry_count: int = 1,
+                 on_error: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+                 editor_url: Optional[str] = None,
+                 image_uploader: Optional[Callable[[str], str]] = None,
+                 image_upload_mode: ImageUploadMode = 'local',
+                 code_theme: CodeTheme = 'atom-one-dark',
+                 mac_style: bool = True,
+                 browser_ws_endpoint: Optional[str] = None,
+                 browser_type: BrowserType = 'chromium',
+                 browser_connection_type: BrowserConnectionType = 'auto',
+                 browser_token: Optional[str] = None,
+                 clean_html: bool = True) -> None:  # 新增参数
         """
         初始化转换器
-        
-        :param headless: 是否使用无头模式
+
+        :param headless: 是否使用无头模式（远程浏览器时忽略）
         :param wait_timeout: 等待超时时间（秒）
         :param retry_count: 失败重试次数
         :param on_error: 错误通知回调函数
         :param editor_url: 自定义编辑器网址
         :param image_uploader: 图片上传回调函数
-        :param image_upload_mode: 图片上传模式
-        :param chromedriver_path: 自定义 ChromeDriver 路径（可选，默认自动管理）
+        :param image_upload_mode: 图片上传模式（local/remote/all）
+        :param code_theme: 代码主题
+        :param mac_style: 是否启用 Mac 风格
+        :param browser_ws_endpoint: 远程浏览器 WebSocket 端点
+        :param browser_type: 浏览器类型（chromium/firefox/webkit）
+        :param browser_connection_type: 连接类型（auto/cdp/playwright）
+        :param browser_token: 远程浏览器访问令牌
+        :param clean_html: 是否清理HTML中的编辑器标记（默认True）
         """
         self.headless: bool = headless
-        self.wait_timeout: int = wait_timeout
+        self.wait_timeout: int = wait_timeout * 1000  # Playwright 使用毫秒
         self.retry_count: int = retry_count
-        self.on_error: Optional[Callable[[
-            str, Dict[str, Any]], None]] = on_error
+        self.on_error: Optional[Callable[[str, Dict[str, Any]], None]] = on_error
         self.image_uploader: Optional[Callable[[str], str]] = image_uploader
         self.image_upload_mode: ImageUploadMode = image_upload_mode
-        self.driver: Optional[webdriver.Chrome] = None
+        self.code_theme: CodeTheme = code_theme
+        self.mac_style: bool = mac_style
+        self.clean_html: bool = clean_html
+
+        # 远程浏览器配置
+        self.browser_ws_endpoint: Optional[str] = browser_ws_endpoint
+        self.browser_type: BrowserType = browser_type
+        self.browser_connection_type: BrowserConnectionType = browser_connection_type
+        self.browser_token: Optional[str] = browser_token
+
+        # Playwright 相关对象
+        self.playwright: Optional[Playwright] = None
+        self.browser: Optional[Browser] = None
+        self.page: Optional[Page] = None
 
         # 默认和备用地址
         self.default_url: str = "https://xiaoqiangclub.github.io/md/"
@@ -171,11 +197,9 @@ class MarkdownConverter:
             self.url_list.append(editor_url)
             print(f"🔧 使用自定义编辑器地址: {editor_url}")
 
-        # 添加默认地址（如果不是自定义地址）
         if editor_url != self.default_url:
             self.url_list.append(self.default_url)
 
-        # 添加备用地址（如果不重复）
         if self.backup_url not in self.url_list:
             self.url_list.append(self.backup_url)
 
@@ -188,6 +212,32 @@ class MarkdownConverter:
                 "默认" if url == self.default_url else "备用")
             print(f"   {idx}. [{url_type}] {url}")
 
+        # 浏览器模式提示
+        if self.browser_ws_endpoint:
+            connection_type_name = {
+                'auto': '自动检测',
+                'cdp': 'CDP (browserless)',
+                'playwright': 'Playwright 协议'
+            }
+            print(f"🌐 浏览器模式: 远程浏览器")
+            print(f"   WebSocket: {self.browser_ws_endpoint}")
+            print(
+                f"   连接类型: {connection_type_name.get(self.browser_connection_type, self.browser_connection_type)}")
+            print(f"   浏览器类型: {self.browser_type}")
+            if self.browser_token:
+                print(f"   Token: {'*' * 8}{self.browser_token[-4:] if len(self.browser_token) > 4 else '****'}")
+        else:
+            print(f"💻 浏览器模式: 本地浏览器 ({'无头' if self.headless else '有头'})")
+
+        # 代码主题提示
+        if self.code_theme not in self.AVAILABLE_CODE_THEMES:
+            print(f"⚠️ 警告: 代码主题 '{self.code_theme}' 无效，将使用默认主题 'atom-one-dark'")
+            self.code_theme = 'atom-one-dark'
+        else:
+            print(f"💻 代码主题: {self.CODE_THEME_CONFIG[self.code_theme]['name']}")
+
+        print(f"🍎 Mac 风格: {'已启用' if self.mac_style else '已禁用'}")
+
         # 图片上传功能提示
         if self.image_uploader:
             mode_names = {
@@ -199,86 +249,186 @@ class MarkdownConverter:
         elif self.image_upload_mode != 'local':
             print(f"⚠️ 警告: 未设置图片上传函数，image_upload_mode 参数将被忽略")
 
-        # ChromeDriver 路径
-        self.chromedriver_path: Optional[str] = chromedriver_path
+    def _clean_html(self, html_content: str) -> str:
+        """
+        清理HTML中的编辑器标记
 
-    def _notify_error(self, error_msg: str, context: Optional[Dict[str, Any]] = None) -> None:
-        """
-        发送错误通知
-        
-        :param error_msg: 错误消息
-        :param context: 错误上下文信息
-        """
-        if self.on_error:
-            try:
-                self.on_error(error_msg, context or {})
-            except Exception as e:
-                print(f"⚠️ 错误通知回调执行失败: {e}")
+        移除：
+        - data-tool="mdnice编辑器"
+        - data-website="https://www.mdnice.com"
+        - 其他 mdnice 相关属性
 
-    def _retry_on_error(self, func: Callable, *args, **kwargs) -> Any:
+        :param html_content: 原始HTML内容
+        :return: 清理后的HTML内容
         """
-        带重试机制的函数执行器
-        
-        :param func: 要执行的函数
-        :return: 函数执行结果
-        """
-        last_error = None
-        for attempt in range(self.retry_count + 1):
-            try:
-                if attempt > 0:
-                    print(f"🔄 正在进行第 {attempt}/{self.retry_count} 次重试...")
-                    time.sleep(2)
-                result = func(*args, **kwargs)
-                if attempt > 0:
-                    print(f"✅ 重试成功！")
-                return result
-            except Exception as e:
-                last_error = e
-                if attempt < self.retry_count:
-                    print(f"❌ 执行失败（第{attempt + 1}次尝试）: {str(e)}")
-                    print(f"⏳ 将在2秒后重试...")
-        raise last_error
+        if not self.clean_html:
+            return html_content
 
+        try:
+            import re
+
+            # 移除 data-tool 属性
+            html_content = re.sub(
+                r'\s*data-tool="mdnice编辑器"',
+                '',
+                html_content
+            )
+
+            # 移除 data-website 属性
+            html_content = re.sub(
+                r'\s*data-website="[^"]*"',
+                '',
+                html_content
+            )
+
+            # 可选：移除其他 mdnice 相关的 data 属性
+            # html_content = re.sub(
+            #     r'\s*data-mdnice-[^=]*="[^"]*"',
+            #     '',
+            #     html_content
+            # )
+
+            print("✅ HTML 已清理编辑器标记")
+            return html_content
+
+        except Exception as e:
+            print(f"⚠️ HTML 清理失败: {e}")
+            # 清理失败也返回原内容，不影响功能
+            return html_content
+
+    def _build_ws_url_with_token(self, ws_endpoint: str, token: Optional[str]) -> str:
+        """
+        构建带 Token 的 WebSocket URL
+
+        :param ws_endpoint: WebSocket 端点
+        :param token: 访问令牌
+        :return: 完整的 WebSocket URL
+        """
+        if not token:
+            return ws_endpoint
+
+        if '?' in ws_endpoint:
+            return f"{ws_endpoint}&token={token}"
+        else:
+            return f"{ws_endpoint}?token={token}"
+
+    def _detect_connection_type(self, ws_endpoint: str) -> BrowserConnectionType:
+        """
+        自动检测连接类型
+
+        :param ws_endpoint: WebSocket 端点
+        :return: 连接类型
+        """
+        if 'browserless' in ws_endpoint.lower():
+            return 'cdp'
+
+        if 'playwright' in ws_endpoint.lower():
+            return 'playwright'
+
+        if '/devtools/browser/' in ws_endpoint:
+            return 'cdp'
+
+        return 'cdp'
 
     def _init_driver(self) -> None:
         """初始化浏览器驱动"""
         try:
-            chrome_options = Options()
-            if self.headless:
-                chrome_options.add_argument('--headless=new')
-            chrome_options.add_argument('--no-sandbox')
-            chrome_options.add_argument('--disable-dev-shm-usage')
-            chrome_options.add_argument('--disable-gpu')
-            chrome_options.add_argument('--window-size=1920,1080')
-            chrome_options.add_argument('--enable-clipboard')
-            chrome_options.add_experimental_option('prefs', {
-                'profile.default_content_setting_values.clipboard': 1
-            })
+            self.playwright = sync_playwright().start()
 
-            # 支持自定义驱动路径
-            if self.chromedriver_path:
-                from selenium.webdriver.chrome.service import Service
-                service = Service(executable_path=self.chromedriver_path)
-                self.driver = webdriver.Chrome(
-                    service=service, options=chrome_options)
-                print(f"✅ 使用自定义 ChromeDriver: {self.chromedriver_path}")
+            if self.browser_ws_endpoint:
+                ws_url = self._build_ws_url_with_token(
+                    self.browser_ws_endpoint,
+                    self.browser_token
+                )
+
+                connection_type = self.browser_connection_type
+                if connection_type == 'auto':
+                    connection_type = self._detect_connection_type(self.browser_ws_endpoint)
+                    print(f"🔍 自动检测连接类型: {connection_type}")
+
+                print(f"🔗 正在连接到远程浏览器...")
+                print(f"   端点: {self.browser_ws_endpoint}")
+                print(f"   连接方式: {connection_type}")
+
+                browser_launcher = getattr(self.playwright, self.browser_type)
+
+                if connection_type == 'cdp':
+                    try:
+                        self.browser = browser_launcher.connect_over_cdp(ws_url)
+                        print(f"✅ 已通过 CDP 连接到远程浏览器")
+                    except Exception as e:
+                        print(f"⚠️ CDP 连接失败: {e}")
+                        print(f"🔄 尝试使用 Playwright 协议连接...")
+                        self.browser = browser_launcher.connect(ws_url)
+                        print(f"✅ 已通过 Playwright 协议连接到远程浏览器")
+
+                elif connection_type == 'playwright':
+                    self.browser = browser_launcher.connect(ws_url)
+                    print(f"✅ 已通过 Playwright 协议连接到远程浏览器")
+
+                else:
+                    raise ValueError(f"不支持的连接类型: {connection_type}")
+
+                if self.browser.contexts:
+                    context = self.browser.contexts[0]
+                    print(f"   使用现有浏览器上下文")
+                else:
+                    context = self.browser.new_context(
+                        viewport={'width': 1920, 'height': 1080},
+                        permissions=['clipboard-read', 'clipboard-write']
+                    )
+                    print(f"   创建新浏览器上下文")
+
+                self.page = context.new_page()
+                print(f"   创建新页面成功")
+
             else:
-                # 使用 Selenium Manager 自动管理
-                self.driver = webdriver.Chrome(options=chrome_options)
-                print("✅ 浏览器驱动初始化成功（自动管理）")
+                browser_launcher = getattr(self.playwright, self.browser_type)
 
-            self.driver.implicitly_wait(10)
-            self.driver.set_page_load_timeout(self.wait_timeout)
+                self.browser = browser_launcher.launch(
+                    headless=self.headless,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-gpu'
+                    ]
+                )
+
+                context = self.browser.new_context(
+                    viewport={'width': 1920, 'height': 1080},
+                    permissions=['clipboard-read', 'clipboard-write']
+                )
+
+                self.page = context.new_page()
+
+                print(f"✅ 本地浏览器驱动初始化成功（{self.browser_type}）")
+
+            self.page.set_default_timeout(self.wait_timeout)
 
         except Exception as e:
             error_msg = f"浏览器驱动初始化失败: {str(e)}"
             print(f"❌ {error_msg}")
 
-            if "chromedriver" in str(e).lower():
+            if self.browser_ws_endpoint:
+                print("💡 远程浏览器连接失败，请检查：")
+                print("   1. 远程浏览器服务是否正在运行")
+                print("   2. WebSocket 端点是否正确")
+                print("   3. Token 是否有效（如果需要）")
+                print("   4. 网络连接和防火墙设置")
+                print(f"\n🔧 测试连接：")
+
+                test_url = self.browser_ws_endpoint.replace('ws://', 'http://').replace('wss://', 'https://')
+                if '?' in test_url:
+                    test_url = test_url.split('?')[0]
+                print(f"   curl {test_url}")
+
+                print(f"\n📚 支持的部署方式：")
+                print(f"   - browserless: docker run -p 3000:3000 ghcr.io/browserless/chromium")
+                print(f"   - Playwright: docker run -p 3001:3000 mcr.microsoft.com/playwright:latest")
+            else:
                 print("💡 提示：")
-                print("   1. 确保已安装 Chrome 浏览器")
-                print("   2. 首次运行时会自动下载 ChromeDriver")
-                print("   3. 或手动指定路径：chromedriver_path='/path/to/chromedriver'")
+                print("   1. 确保已安装 Playwright: pip install playwright")
+                print("   2. 首次使用需安装浏览器: playwright install chromium")
 
             self._notify_error(
                 error_msg, {'stage': '初始化浏览器', 'error_type': type(e).__name__})
@@ -286,13 +436,19 @@ class MarkdownConverter:
 
     def _close_driver(self) -> None:
         """关闭浏览器驱动"""
-        if self.driver:
-            try:
-                self.driver.quit()
-                self.driver = None
-                print("✅ 浏览器已关闭")
-            except Exception as e:
-                print(f"⚠️ 关闭浏览器时出错: {e}")
+        try:
+            if self.page:
+                self.page.close()
+                self.page = None
+            if self.browser:
+                self.browser.close()
+                self.browser = None
+            if self.playwright:
+                self.playwright.stop()
+                self.playwright = None
+            print("✅ 浏览器已关闭")
+        except Exception as e:
+            print(f"⚠️ 关闭浏览器时出错: {e}")
 
     def _load_page(self) -> None:
         """加载网页（支持多URL自动切换）"""
@@ -303,22 +459,17 @@ class MarkdownConverter:
                 self.current_url = url
                 self.current_url_index = url_index
 
-                # 提示切换地址
                 if url_index > 0:
                     url_type = "备用" if url == self.backup_url else (
                         "默认" if url == self.default_url else "其他")
                     print(f"🔄 切换到{url_type}地址...")
 
-                print(
-                    f"🌐 正在打开网页 [{url_index + 1}/{len(self.url_list)}]: {self.current_url}")
-                self.driver.get(self.current_url)
+                print(f"🌐 正在打开网页 [{url_index + 1}/{len(self.url_list)}]: {self.current_url}")
 
-                # 等待关键元素加载
-                WebDriverWait(self.driver, self.wait_timeout).until(
-                    EC.presence_of_element_located(
-                        (By.CLASS_NAME, "CodeMirror"))
-                )
+                self.page.goto(self.current_url, wait_until='domcontentloaded')
+                self.page.wait_for_selector('.CodeMirror', timeout=self.wait_timeout)
                 time.sleep(3)
+
                 print(f"✅ 网页加载成功")
                 return
 
@@ -327,12 +478,10 @@ class MarkdownConverter:
                 error_msg = f"网页加载失败 ({url}): {str(e)}"
                 print(f"❌ {error_msg}")
 
-                # 如果还有其他URL可尝试
                 if url_index < len(self.url_list) - 1:
                     print(f"⏳ 将在2秒后尝试下一个地址...")
                     time.sleep(2)
                 else:
-                    # 所有URL都失败了
                     final_error_msg = f"所有地址均无法访问（共尝试 {len(self.url_list)} 个）"
                     print(f"💔 {final_error_msg}")
                     self._notify_error(
@@ -353,7 +502,7 @@ class MarkdownConverter:
             js_code = """
             window._capturedHTML = null;
             window._copyInterceptorReady = false;
-            
+
             document.addEventListener('copy', function(e) {
                 console.log('复制事件已触发');
                 if (e.clipboardData) {
@@ -364,11 +513,11 @@ class MarkdownConverter:
                     }
                 }
             }, true);
-            
+
             window._copyInterceptorReady = true;
             console.log('复制拦截器已安装');
             """
-            self.driver.execute_script(js_code)
+            self.page.evaluate(js_code)
             print("✅ 已注入复制拦截器")
         except Exception as e:
             error_msg = f"注入拦截器失败: {str(e)}"
@@ -380,20 +529,18 @@ class MarkdownConverter:
     def _select_theme(self, theme: str) -> None:
         """
         选择主题
-        
+
         :param theme: 主题名称
         """
         try:
-            theme_button = WebDriverWait(self.driver, self.wait_timeout).until(
-                EC.element_to_be_clickable((By.ID, "nice-menu-theme"))
-            )
+            theme_button = self.page.locator('#nice-menu-theme')
+            theme_button.wait_for(state='visible', timeout=self.wait_timeout)
             theme_button.click()
             time.sleep(0.5)
 
-            theme_id = f"nice-menu-theme-{theme}"
-            theme_item = WebDriverWait(self.driver, self.wait_timeout).until(
-                EC.element_to_be_clickable((By.ID, theme_id))
-            )
+            theme_id = f'#nice-menu-theme-{theme}'
+            theme_item = self.page.locator(theme_id)
+            theme_item.wait_for(state='visible', timeout=self.wait_timeout)
             theme_item.click()
 
             print(f"🎨 已选择主题: {self.THEME_NAMES.get(theme, theme)}")
@@ -405,10 +552,132 @@ class MarkdownConverter:
                 error_msg, {'stage': '选择主题', 'theme': theme, 'error_type': type(e).__name__})
             raise ConversionError(error_msg) from e
 
+    def _select_code_theme(self, code_theme: str) -> None:
+        """
+        选择代码主题
+
+        :param code_theme: 代码主题名称
+        """
+        try:
+            if code_theme not in self.AVAILABLE_CODE_THEMES:
+                print(f"⚠️ 跳过无效的代码主题: {code_theme}")
+                return
+
+            code_theme_button = self.page.locator('#nice-menu-codetheme')
+            code_theme_button.wait_for(state='visible', timeout=self.wait_timeout)
+            code_theme_button.click()
+            time.sleep(0.5)
+
+            theme_config = self.CODE_THEME_CONFIG[code_theme]
+            theme_id = f'#{theme_config["id"]}'
+            theme_item = self.page.locator(theme_id)
+            theme_item.wait_for(state='visible', timeout=self.wait_timeout)
+            theme_item.click()
+
+            print(f"💻 已选择代码主题: {theme_config['name']}")
+
+            self.page.evaluate("() => document.body.click()")
+            time.sleep(0.5)
+
+        except Exception as e:
+            error_msg = f"选择代码主题失败: {str(e)}"
+            print(f"❌ {error_msg}")
+            self._notify_error(
+                error_msg, {'stage': '选择代码主题', 'code_theme': code_theme, 'error_type': type(e).__name__})
+            raise ConversionError(error_msg) from e
+
+    def _set_mac_style(self, enable: bool) -> None:
+        """
+        设置 Mac 风格
+
+        :param enable: 是否启用 Mac 风格
+        """
+        try:
+            code_theme_button = self.page.locator('#nice-menu-codetheme')
+            code_theme_button.wait_for(state='visible', timeout=self.wait_timeout)
+            code_theme_button.click()
+            time.sleep(0.5)
+
+            mac_style_button = self.page.locator('#nice-menu-codetheme-apple')
+            mac_style_button.wait_for(state='visible', timeout=self.wait_timeout)
+
+            is_selected = self.page.evaluate("""
+                () => {
+                    const element = document.querySelector('#nice-menu-codetheme-apple');
+                    if (!element) return false;
+
+                    const classList = element.className;
+                    const style = window.getComputedStyle(element);
+
+                    return classList.includes('selected') || 
+                           classList.includes('active') ||
+                           classList.includes('checked') ||
+                           element.getAttribute('aria-checked') === 'true' ||
+                           style.backgroundColor !== 'rgba(0, 0, 0, 0)';
+                }
+            """)
+
+            should_click = (enable and not is_selected) or (not enable and is_selected)
+
+            if should_click:
+                mac_style_button.click()
+                action = '启用' if enable else '禁用'
+                print(f"🍎 已{action} Mac 风格")
+            else:
+                status = '已启用' if enable else '已禁用'
+                print(f"🍎 Mac 风格{status}（无需切换）")
+
+            self.page.evaluate("() => document.body.click()")
+            time.sleep(0.5)
+
+        except Exception as e:
+            error_msg = f"设置 Mac 风格失败: {str(e)}"
+            print(f"❌ {error_msg}")
+            self._notify_error(
+                error_msg, {'stage': '设置Mac风格', 'enable': enable, 'error_type': type(e).__name__})
+            raise ConversionError(error_msg) from e
+
+    def _notify_error(self, error_msg: str, context: Optional[Dict[str, Any]] = None) -> None:
+        """
+        发送错误通知
+
+        :param error_msg: 错误消息
+        :param context: 错误上下文信息
+        """
+        if self.on_error:
+            try:
+                self.on_error(error_msg, context or {})
+            except Exception as e:
+                print(f"⚠️ 错误通知回调执行失败: {e}")
+
+    def _retry_on_error(self, func: Callable, *args, **kwargs) -> Any:
+        """
+        带重试机制的函数执行器
+
+        :param func: 要执行的函数
+        :return: 函数执行结果
+        """
+        last_error = None
+        for attempt in range(self.retry_count + 1):
+            try:
+                if attempt > 0:
+                    print(f"🔄 正在进行第 {attempt}/{self.retry_count} 次重试...")
+                    time.sleep(2)
+                result = func(*args, **kwargs)
+                if attempt > 0:
+                    print(f"✅ 重试成功！")
+                return result
+            except Exception as e:
+                last_error = e
+                if attempt < self.retry_count:
+                    print(f"❌ 执行失败（第{attempt + 1}次尝试）: {str(e)}")
+                    print(f"⏳ 将在2秒后重试...")
+        raise last_error
+
     def _is_remote_url(self, path: str) -> bool:
         """
         判断路径是否为网络URL
-        
+
         :param path: 路径字符串
         :return: 是否为网络URL
         """
@@ -418,7 +687,7 @@ class MarkdownConverter:
     def _is_data_url(self, path: str) -> bool:
         """
         判断是否为Data URL（base64编码的图片）
-        
+
         :param path: 路径字符串
         :return: 是否为Data URL
         """
@@ -427,7 +696,7 @@ class MarkdownConverter:
     def _should_upload_image(self, image_path: str, is_remote: bool) -> bool:
         """
         根据上传模式判断是否应该上传该图片
-        
+
         :param image_path: 图片路径
         :param is_remote: 是否为远程URL
         :return: 是否应该上传
@@ -435,11 +704,9 @@ class MarkdownConverter:
         if not self.image_uploader:
             return False
 
-        # Data URL 特殊处理：在 'all' 模式下才上传
         if self._is_data_url(image_path):
             return self.image_upload_mode == 'all'
 
-        # 根据模式决定是否上传
         if self.image_upload_mode == 'all':
             return True
         elif self.image_upload_mode == 'local':
@@ -452,7 +719,7 @@ class MarkdownConverter:
     def _process_images_in_markdown(self, markdown_content: str, base_path: Optional[Path] = None) -> str:
         """
         处理Markdown中的图片，根据模式上传到图床
-        
+
         :param markdown_content: Markdown内容
         :param base_path: Markdown文件所在目录，用于解析相对路径
         :return: 处理后的Markdown内容
@@ -465,10 +732,8 @@ class MarkdownConverter:
             'remote': '仅网络图片',
             'all': '所有图片'
         }
-        print(
-            f"🖼️ 开始处理Markdown中的图片 [模式: {mode_names[self.image_upload_mode]}]")
+        print(f"🖼️ 开始处理Markdown中的图片 [模式: {mode_names[self.image_upload_mode]}]")
 
-        # 匹配Markdown图片语法：![alt](path) 和 ![alt](path "title")
         pattern = r'!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)'
 
         uploaded_count = 0
@@ -482,11 +747,9 @@ class MarkdownConverter:
             image_path = match.group(2)
             title_text = match.group(3) if match.group(3) else None
 
-            # 检查是否为远程URL
             is_remote = self._is_remote_url(image_path)
             is_data = self._is_data_url(image_path)
 
-            # 判断是否应该上传
             if not self._should_upload_image(image_path, is_remote):
                 skipped_count += 1
                 if is_remote:
@@ -497,30 +760,23 @@ class MarkdownConverter:
                     print(f"  ⏭️ 跳过本地图片 [模式不匹配]: {Path(image_path).name}")
                 return match.group(0)
 
-            # 需要上传的图片
             try:
                 upload_target = image_path
 
-                # 如果是本地路径，需要解析完整路径
                 if not is_remote and not is_data:
-                    # 处理相对路径
                     if base_path and not os.path.isabs(image_path):
                         full_path = base_path / image_path
                     else:
                         full_path = Path(image_path)
 
-                    # 规范化路径
                     full_path = full_path.resolve()
 
-                    # 检查文件是否存在
                     if not full_path.exists():
                         print(f"  ⚠️ 图片文件不存在，保持原样: {image_path}")
                         skipped_count += 1
                         return match.group(0)
 
-                    # 检查是否为图片文件
-                    valid_extensions = {'.jpg', '.jpeg',
-                                        '.png', '.gif', '.bmp', '.webp', '.svg'}
+                    valid_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg'}
                     if full_path.suffix.lower() not in valid_extensions:
                         print(f"  ⚠️ 非图片文件，跳过: {full_path.name}")
                         skipped_count += 1
@@ -533,7 +789,6 @@ class MarkdownConverter:
                 else:
                     print(f"  📤 正在上传网络图片: {image_path[:60]}...")
 
-                # 调用用户提供的上传函数
                 uploaded_url = self.image_uploader(upload_target)
 
                 if not uploaded_url:
@@ -542,7 +797,6 @@ class MarkdownConverter:
                 print(f"  ✅ 图片已上传: {uploaded_url}")
                 uploaded_count += 1
 
-                # 返回新的Markdown图片语法
                 if title_text:
                     return f'![{alt_text}]({uploaded_url} "{title_text}")'
                 else:
@@ -551,17 +805,13 @@ class MarkdownConverter:
             except Exception as e:
                 print(f"  ❌ 图片上传失败: {str(e)}")
                 failed_count += 1
-                # 上传失败，保持原样
                 return match.group(0)
 
-        # 替换所有图片
         result = re.sub(pattern, replace_image, markdown_content)
 
-        # 输出统计信息
         total = uploaded_count + skipped_count + failed_count
         if total > 0:
-            print(
-                f"🖼️ 图片处理完成: 共 {total} 张 (上传 {uploaded_count}, 跳过 {skipped_count}, 失败 {failed_count})")
+            print(f"🖼️ 图片处理完成: 共 {total} 张 (上传 {uploaded_count}, 跳过 {skipped_count}, 失败 {failed_count})")
         else:
             print(f"🖼️ 未检测到图片")
 
@@ -570,44 +820,47 @@ class MarkdownConverter:
     def _input_markdown(self, markdown_content: str) -> None:
         """
         输入Markdown内容并触发转换
-        
+
         :param markdown_content: Markdown文本内容
         """
         try:
             print(f"📝 正在输入Markdown内容（{len(markdown_content)} 字符）...")
 
             js_code = """
-            var editor = document.querySelector('.CodeMirror').CodeMirror;
-            var content = arguments[0];
-            
-            if (!editor) {
-                throw new Error('找不到CodeMirror编辑器');
+            (content) => {
+                var editor = document.querySelector('.CodeMirror').CodeMirror;
+
+                if (!editor) {
+                    throw new Error('找不到CodeMirror编辑器');
+                }
+
+                editor.setValue(content);
+                editor.refresh();
+
+                var changeEvent = new Event('change', { bubbles: true });
+                var inputEvent = new Event('input', { bubbles: true });
+
+                editor.getTextArea().dispatchEvent(changeEvent);
+                editor.getTextArea().dispatchEvent(inputEvent);
+
+                setTimeout(function() {
+                    editor.focus();
+                    editor.execCommand('selectAll');
+                    editor.replaceSelection(content);
+                }, 100);
+
+                return true;
             }
-            
-            editor.setValue(content);
-            editor.refresh();
-            
-            var changeEvent = new Event('change', { bubbles: true });
-            var inputEvent = new Event('input', { bubbles: true });
-            
-            editor.getTextArea().dispatchEvent(changeEvent);
-            editor.getTextArea().dispatchEvent(inputEvent);
-            
-            setTimeout(function() {
-                editor.focus();
-                editor.execCommand('selectAll');
-                editor.replaceSelection(content);
-            }, 100);
-            
-            return true;
             """
 
-            self.driver.execute_script(js_code, markdown_content)
+            self.page.evaluate(js_code, markdown_content)
             time.sleep(1)
 
-            current_content = self.driver.execute_script("""
-                var editor = document.querySelector('.CodeMirror').CodeMirror;
-                return editor ? editor.getValue() : null;
+            current_content = self.page.evaluate("""
+                () => {
+                    var editor = document.querySelector('.CodeMirror').CodeMirror;
+                    return editor ? editor.getValue() : null;
+                }
             """)
 
             if current_content is None:
@@ -637,7 +890,7 @@ class MarkdownConverter:
     def _wait_for_preview_update(self, timeout: int = 10) -> bool:
         """
         等待预览区域更新
-        
+
         :param timeout: 超时时间（秒）
         :return: 是否成功更新
         """
@@ -645,13 +898,15 @@ class MarkdownConverter:
 
         while time.time() - start_time < timeout:
             try:
-                preview_content = self.driver.execute_script("""
-                    var editor = document.querySelector('#nice-rich-text-editor');
-                    if (editor && editor.innerHTML) {
-                        var content = editor.innerHTML.trim();
-                        return content.length > 100;
+                preview_content = self.page.evaluate("""
+                    () => {
+                        var editor = document.querySelector('#nice-rich-text-editor');
+                        if (editor && editor.innerHTML) {
+                            var content = editor.innerHTML.trim();
+                            return content.length > 100;
+                        }
+                        return false;
                     }
-                    return false;
                 """)
 
                 if preview_content:
@@ -669,11 +924,13 @@ class MarkdownConverter:
         """清空编辑器内容"""
         try:
             js_clear = """
-            var editor = document.querySelector('.CodeMirror').CodeMirror;
-            editor.setValue('');
-            editor.refresh();
+            () => {
+                var editor = document.querySelector('.CodeMirror').CodeMirror;
+                editor.setValue('');
+                editor.refresh();
+            }
             """
-            self.driver.execute_script(js_clear)
+            self.page.evaluate(js_clear)
             time.sleep(0.5)
             print("✅ 已清空编辑器")
         except Exception as e:
@@ -682,7 +939,7 @@ class MarkdownConverter:
     def _get_converted_html(self, platform: Platform = 'wechat') -> str:
         """
         获取转换后的HTML内容（带样式）
-        
+
         :param platform: 目标平台
         :return: 转换后的带样式HTML字符串
         """
@@ -696,50 +953,50 @@ class MarkdownConverter:
 
             print(f"📋 准备获取 {platform_name} 格式HTML...")
 
-            preview_check = self.driver.execute_script("""
-                var editor = document.querySelector('#nice-rich-text-editor');
-                if (editor) {
-                    return {
-                        hasContent: editor.innerHTML.trim().length > 0,
-                        contentLength: editor.innerHTML.trim().length
-                    };
+            preview_check = self.page.evaluate("""
+                () => {
+                    var editor = document.querySelector('#nice-rich-text-editor');
+                    if (editor) {
+                        return {
+                            hasContent: editor.innerHTML.trim().length > 0,
+                            contentLength: editor.innerHTML.trim().length
+                        };
+                    }
+                    return null;
                 }
-                return null;
             """)
 
             if preview_check:
-                print(
-                    f"📊 预览区域状态: 长度={preview_check['contentLength']}, 有内容={preview_check['hasContent']}")
+                print(f"📊 预览区域状态: 长度={preview_check['contentLength']}, 有内容={preview_check['hasContent']}")
                 if not preview_check['hasContent']:
                     print("⚠️ 警告：预览区域为空！可能转换未成功")
 
-            self.driver.execute_script("window._capturedHTML = null;")
+            self.page.evaluate("() => { window._capturedHTML = null; }")
 
             try:
-                copy_button = WebDriverWait(self.driver, self.wait_timeout).until(
-                    EC.element_to_be_clickable((By.ID, button_id))
-                )
+                copy_button = self.page.locator(f'#{button_id}')
+                copy_button.wait_for(state='visible', timeout=self.wait_timeout)
                 print(f"✅ 找到 {platform_name} 复制按钮")
-            except TimeoutException:
-                raise ConversionError(
-                    f"找不到 {platform_name} 复制按钮（ID: {button_id}）")
+            except PlaywrightTimeoutError:
+                raise ConversionError(f"找不到 {platform_name} 复制按钮（ID: {button_id}）")
 
             print(f"📋 正在触发 {platform_name} 格式复制...")
             copy_button.click()
             time.sleep(1.5)
 
-            html_content = self.driver.execute_script(
-                "return window._capturedHTML;")
+            html_content = self.page.evaluate("() => window._capturedHTML")
 
             if not html_content:
-                print("🔄 尝试使用CDP方法...")
-                html_content = self._get_html_via_cdp(button_id)
+                print("🔄 尝试使用剪贴板API...")
+                html_content = self._get_html_via_clipboard(button_id)
 
             if not html_content:
                 print("⚠️ 使用降级方案：直接从DOM获取（可能缺少部分样式）")
-                html_content = self.driver.execute_script("""
-                    var editor = document.querySelector('#nice-rich-text-editor');
-                    return editor ? editor.innerHTML : '';
+                html_content = self.page.evaluate("""
+                    () => {
+                        var editor = document.querySelector('#nice-rich-text-editor');
+                        return editor ? editor.innerHTML : '';
+                    }
                 """)
 
             if not html_content or len(html_content) < 50:
@@ -752,10 +1009,12 @@ class MarkdownConverter:
             has_style_tag = '<style>' in html_content
 
             if has_inline_style or has_style_tag:
-                print(
-                    f"✅ HTML包含样式信息（内联样式:{has_inline_style}, 样式标签:{has_style_tag}）")
+                print(f"✅ HTML包含样式信息（内联样式:{has_inline_style}, 样式标签:{has_style_tag}）")
             else:
                 print("⚠️ 警告：HTML可能不包含样式信息")
+
+            # 清理HTML（新增）
+            html_content = self._clean_html(html_content)
 
             return html_content
 
@@ -764,12 +1023,12 @@ class MarkdownConverter:
             print(f"❌ {error_msg}")
 
             try:
-                debug_info = self.driver.execute_script("""
-                    return {
+                debug_info = self.page.evaluate("""
+                    () => ({
                         editorValue: document.querySelector('.CodeMirror')?.CodeMirror?.getValue()?.substring(0, 100),
                         previewContent: document.querySelector('#nice-rich-text-editor')?.innerHTML?.substring(0, 100),
                         capturedHTML: window._capturedHTML ? 'exists' : 'null'
-                    };
+                    })
                 """)
                 print(f"🔍 调试信息: {debug_info}")
             except:
@@ -782,53 +1041,48 @@ class MarkdownConverter:
             })
             raise ConversionError(error_msg) from e
 
-    def _get_html_via_cdp(self, button_id: str) -> Optional[str]:
+    def _get_html_via_clipboard(self, button_id: str) -> Optional[str]:
         """
-        通过CDP获取剪贴板内容
-        
+        通过剪贴板API获取HTML内容
+
         :param button_id: 复制按钮的ID
         :return: 剪贴板中的HTML内容
         """
         try:
-            self.driver.execute_cdp_cmd('Browser.grantPermissions', {
-                'permissions': ['clipboardReadWrite', 'clipboardSanitizedWrite']
-            })
-
             js_read_clipboard = f"""
-            return new Promise(async (resolve) => {{
+            async () => {{
                 try {{
                     document.querySelector('#{button_id}').click();
                     await new Promise(r => setTimeout(r, 800));
-                    
+
                     const clipboardItems = await navigator.clipboard.read();
                     for (const item of clipboardItems) {{
                         if (item.types.includes('text/html')) {{
                             const blob = await item.getType('text/html');
                             const text = await blob.text();
-                            resolve(text);
-                            return;
+                            return text;
                         }}
                     }}
-                    resolve(null);
+                    return null;
                 }} catch (err) {{
                     console.error('读取剪贴板失败:', err);
-                    resolve(null);
+                    return null;
                 }}
-            }});
+            }}
             """
 
-            html_content = self.driver.execute_script(js_read_clipboard)
+            html_content = self.page.evaluate(js_read_clipboard)
             if html_content:
-                print("✅ 通过CDP成功获取剪贴板内容")
+                print("✅ 通过剪贴板API成功获取内容")
             return html_content
         except Exception as e:
-            print(f"❌ CDP方法失败: {e}")
+            print(f"❌ 剪贴板API方法失败: {e}")
             return None
 
     def _read_markdown_file(self, file_path: Union[str, Path]) -> str:
         """
         读取Markdown文件
-        
+
         :param file_path: 文件路径
         :return: 文件内容
         """
@@ -848,7 +1102,7 @@ class MarkdownConverter:
     def _wrap_full_html(self, html_content: str, title: str = "文章", platform: Platform = 'wechat') -> str:
         """
         包装为完整HTML文档
-        
+
         :param html_content: HTML内容片段
         :param title: 文档标题
         :param platform: 目标平台
@@ -915,7 +1169,7 @@ class MarkdownConverter:
                    platform: Platform = 'wechat') -> Path:
         """
         保存HTML文件
-        
+
         :param html_content: HTML内容
         :param output_path: 输出路径
         :param original_name: 原始文件名
@@ -930,8 +1184,7 @@ class MarkdownConverter:
             if output_path.is_dir() or not output_path.suffix:
                 output_path.mkdir(parents=True, exist_ok=True)
                 if original_name:
-                    filename = Path(original_name).stem + \
-                        f'_{platform_suffix}.html'
+                    filename = Path(original_name).stem + f'_{platform_suffix}.html'
                 else:
                     filename = f'article_{platform_suffix}_{int(time.time())}.html'
                 output_path = output_path / filename
@@ -957,7 +1210,7 @@ class MarkdownConverter:
     def _parse_theme(self, theme: Union[str, List[str], None]) -> str:
         """
         解析主题选项
-        
+
         :param theme: 主题选项
         :return: 选中的主题名
         """
@@ -982,7 +1235,9 @@ class MarkdownConverter:
                 output_dir: Optional[Union[str, Path]] = None,
                 return_html: bool = True,
                 wrap_full_html: bool = False,
-                platform: Platform = 'wechat') -> Union[str, List[str], Path, List[Path]]:
+                platform: Platform = 'wechat',
+                code_theme: Optional[CodeTheme] = None,
+                mac_style: Optional[bool] = None) -> Union[str, List[str], Path, List[Path]]:
         """
         转换Markdown到指定平台格式
 
@@ -992,11 +1247,16 @@ class MarkdownConverter:
         :param return_html: 是否返回HTML内容
         :param wrap_full_html: 是否包装为完整HTML
         :param platform: 目标平台（wechat/zhihu/juejin）
+        :param code_theme: 代码主题（可选，覆盖初始化时的设置）
+        :param mac_style: Mac 风格（可选，覆盖初始化时的设置）
         :return: HTML内容或文件路径
         """
         try:
             if platform not in self.PLATFORM_CONFIG:
                 raise ValueError(f"不支持的平台: {platform}")
+
+            final_code_theme = code_theme if code_theme is not None else self.code_theme
+            final_mac_style = mac_style if mac_style is not None else self.mac_style
 
             print(f"\n🎯 目标平台: {self.PLATFORM_CONFIG[platform]['name']}")
 
@@ -1011,15 +1271,15 @@ class MarkdownConverter:
             failed_items = []
 
             for idx, md_item in enumerate(markdown_list, 1):
-                print(f"\n{'='*70}")
+                print(f"\n{'=' * 70}")
                 print(f"📌 处理第 {idx}/{len(markdown_list)} 项")
-                print(f"{'='*70}")
+                print(f"{'=' * 70}")
 
                 try:
                     is_file = isinstance(md_item, Path) or (
-                        isinstance(md_item, str) and
-                        (md_item.endswith('.md') or md_item.endswith('.markdown')) and
-                        os.path.exists(md_item)
+                            isinstance(md_item, str) and
+                            (md_item.endswith('.md') or md_item.endswith('.markdown')) and
+                            os.path.exists(md_item)
                     )
 
                     if is_file:
@@ -1028,7 +1288,6 @@ class MarkdownConverter:
                         original_name = file_path.name
                         print(f"📄 读取文件: {md_item}（{len(md_content)} 字符）")
 
-                        # 处理图片（传入文件所在目录用于解析相对路径）
                         md_content = self._process_images_in_markdown(
                             md_content,
                             base_path=file_path.parent
@@ -1038,15 +1297,17 @@ class MarkdownConverter:
                         original_name = None
                         print(f"📝 使用Markdown内容（{len(md_content)} 字符）")
 
-                        # 处理图片（没有基准路径）
-                        md_content = self._process_images_in_markdown(
-                            md_content)
+                        md_content = self._process_images_in_markdown(md_content)
 
                     if idx > 1:
                         self._clear_editor()
 
                     selected_theme = self._parse_theme(theme)
                     self._select_theme(selected_theme)
+
+                    self._select_code_theme(final_code_theme)
+
+                    self._set_mac_style(final_mac_style)
 
                     self._input_markdown(md_content)
 
@@ -1056,8 +1317,7 @@ class MarkdownConverter:
                     if output_dir:
                         file_path = self._save_html(
                             html_content, output_dir, original_name, wrap_full_html, platform)
-                        results.append(
-                            file_path if not return_html else html_content)
+                        results.append(file_path if not return_html else html_content)
                     else:
                         results.append(html_content)
 
@@ -1077,14 +1337,14 @@ class MarkdownConverter:
                     else:
                         print(f"⚠️ 跳过该项，继续处理...")
 
-            print(f"\n{'='*70}")
+            print(f"\n{'=' * 70}")
             if failed_items:
                 print(f"⚠️ 部分完成！成功 {len(results)}/{len(markdown_list)} 项")
                 for item in failed_items:
                     print(f"  ❌ 失败项 {item['index']}: {item['error']}")
             else:
                 print(f"🎉 全部完成！共 {len(results)} 项")
-            print(f"{'='*70}\n")
+            print(f"{'=' * 70}\n")
 
             if not results:
                 raise ConversionError("所有项目均转换失败")
@@ -1106,34 +1366,46 @@ class MarkdownConverter:
 # ============================================================================
 
 def convert(
-    markdown: Union[str, Path, List[Union[str, Path]]],
-    platform: Platform = 'wechat',
-    theme: Union[str, List[str], None] = 'normal',
-    output_dir: Optional[Union[str, Path]] = None,
-    return_html: bool = True,
-    headless: bool = True,
-    wrap_full_html: bool = False,
-    retry_count: int = 1,
-    on_error: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-    editor_url: Optional[str] = None,
-    image_uploader: Optional[Callable[[str], str]] = None,
-    image_upload_mode: ImageUploadMode = 'local'
+        markdown: Union[str, Path, List[Union[str, Path]]],
+        platform: Platform = 'wechat',
+        theme: Union[str, List[str], None] = 'normal',
+        output_dir: Optional[Union[str, Path]] = None,
+        return_html: bool = True,
+        headless: bool = True,
+        wrap_full_html: bool = False,
+        retry_count: int = 1,
+        on_error: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        editor_url: Optional[str] = None,
+        image_uploader: Optional[Callable[[str], str]] = None,
+        image_upload_mode: ImageUploadMode = 'local',
+        code_theme: CodeTheme = 'atom-one-dark',
+        mac_style: bool = True,
+        browser_ws_endpoint: Optional[str] = None,
+        browser_type: BrowserType = 'chromium',
+        browser_connection_type: BrowserConnectionType = 'auto',
+        browser_token: Optional[str] = None
 ) -> Union[str, List[str], Path, List[Path]]:
     """
     通用转换函数：转换Markdown到指定平台格式
 
     :param markdown: Markdown内容或文件路径（支持单个或列表）
-    :param platform: 目标平台
+    :param platform: 目标平台（wechat/zhihu/juejin）
     :param theme: 主题名称、列表或None（随机）
     :param output_dir: 输出目录（None则不保存）
     :param return_html: 是否返回HTML内容
-    :param headless: 是否使用无头模式
+    :param headless: 是否使用无头模式（远程浏览器时忽略）
     :param wrap_full_html: 是否包装为完整HTML文档
     :param retry_count: 失败重试次数
     :param on_error: 错误通知回调函数
     :param editor_url: 自定义编辑器网址
-    :param image_uploader: 图片上传回调函数，接收图片路径或URL，返回图床URL
-    :param image_upload_mode: 图片上传模式（local=仅本地, remote=仅网络, all=全部）
+    :param image_uploader: 图片上传回调函数
+    :param image_upload_mode: 图片上传模式（local/remote/all）
+    :param code_theme: 代码主题
+    :param mac_style: 是否启用 Mac 风格
+    :param browser_ws_endpoint: 远程浏览器 WebSocket 端点
+    :param browser_type: 浏览器类型（chromium/firefox/webkit）
+    :param browser_connection_type: 连接类型（auto/cdp/playwright）
+    :param browser_token: 远程浏览器访问令牌
     :return: HTML内容字符串、文件路径或它们的列表
     """
     converter = MarkdownConverter(
@@ -1142,7 +1414,13 @@ def convert(
         on_error=on_error,
         editor_url=editor_url,
         image_uploader=image_uploader,
-        image_upload_mode=image_upload_mode
+        image_upload_mode=image_upload_mode,
+        code_theme=code_theme,
+        mac_style=mac_style,
+        browser_ws_endpoint=browser_ws_endpoint,
+        browser_type=browser_type,
+        browser_connection_type=browser_connection_type,
+        browser_token=browser_token
     )
     return converter.convert(
         markdown=markdown,
@@ -1155,17 +1433,23 @@ def convert(
 
 
 def to_wechat(
-    markdown: Union[str, Path, List[Union[str, Path]]],
-    theme: Union[str, List[str], None] = 'normal',
-    output_dir: Optional[Union[str, Path]] = None,
-    return_html: bool = True,
-    headless: bool = True,
-    wrap_full_html: bool = False,
-    retry_count: int = 1,
-    on_error: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-    editor_url: Optional[str] = None,
-    image_uploader: Optional[Callable[[str], str]] = None,
-    image_upload_mode: ImageUploadMode = 'local'
+        markdown: Union[str, Path, List[Union[str, Path]]],
+        theme: Union[str, List[str], None] = 'normal',
+        output_dir: Optional[Union[str, Path]] = None,
+        return_html: bool = True,
+        headless: bool = True,
+        wrap_full_html: bool = False,
+        retry_count: int = 1,
+        on_error: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        editor_url: Optional[str] = None,
+        image_uploader: Optional[Callable[[str], str]] = None,
+        image_upload_mode: ImageUploadMode = 'local',
+        code_theme: CodeTheme = 'atom-one-dark',
+        mac_style: bool = True,
+        browser_ws_endpoint: Optional[str] = None,
+        browser_type: BrowserType = 'chromium',
+        browser_connection_type: BrowserConnectionType = 'auto',
+        browser_token: Optional[str] = None
 ) -> Union[str, List[str], Path, List[Path]]:
     """
     转换Markdown为微信公众号格式
@@ -1174,13 +1458,19 @@ def to_wechat(
     :param theme: 主题名称、列表或None（随机）
     :param output_dir: 输出目录
     :param return_html: 是否返回HTML内容
-    :param headless: 是否使用无头模式
+    :param headless: 是否使用无头模式（远程浏览器时忽略）
     :param wrap_full_html: 是否包装为完整HTML文档
     :param retry_count: 失败重试次数
     :param on_error: 错误通知回调函数
     :param editor_url: 自定义编辑器网址
-    :param image_uploader: 图片上传回调函数，接收图片路径或URL，返回图床URL
-    :param image_upload_mode: 图片上传模式（local=仅本地, remote=仅网络, all=全部）
+    :param image_uploader: 图片上传回调函数
+    :param image_upload_mode: 图片上传模式（local/remote/all）
+    :param code_theme: 代码主题
+    :param mac_style: 是否启用 Mac 风格
+    :param browser_ws_endpoint: 远程浏览器 WebSocket 端点
+    :param browser_type: 浏览器类型（chromium/firefox/webkit）
+    :param browser_connection_type: 连接类型（auto/cdp/playwright）
+    :param browser_token: 远程浏览器访问令牌
     :return: HTML内容或文件路径
     """
     return convert(
@@ -1195,38 +1485,39 @@ def to_wechat(
         on_error=on_error,
         editor_url=editor_url,
         image_uploader=image_uploader,
-        image_upload_mode=image_upload_mode
+        image_upload_mode=image_upload_mode,
+        code_theme=code_theme,
+        mac_style=mac_style,
+        browser_ws_endpoint=browser_ws_endpoint,
+        browser_type=browser_type,
+        browser_connection_type=browser_connection_type,
+        browser_token=browser_token
     )
 
 
 def to_zhihu(
-    markdown: Union[str, Path, List[Union[str, Path]]],
-    theme: Union[str, List[str], None] = 'normal',
-    output_dir: Optional[Union[str, Path]] = None,
-    return_html: bool = True,
-    headless: bool = True,
-    wrap_full_html: bool = False,
-    retry_count: int = 1,
-    on_error: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-    editor_url: Optional[str] = None,
-    image_uploader: Optional[Callable[[str], str]] = None,
-    image_upload_mode: ImageUploadMode = 'local'
+        markdown: Union[str, Path, List[Union[str, Path]]],
+        theme: Union[str, List[str], None] = 'normal',
+        output_dir: Optional[Union[str, Path]] = None,
+        return_html: bool = True,
+        headless: bool = True,
+        wrap_full_html: bool = False,
+        retry_count: int = 1,
+        on_error: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        editor_url: Optional[str] = None,
+        image_uploader: Optional[Callable[[str], str]] = None,
+        image_upload_mode: ImageUploadMode = 'local',
+        code_theme: CodeTheme = 'atom-one-dark',
+        mac_style: bool = True,
+        browser_ws_endpoint: Optional[str] = None,
+        browser_type: BrowserType = 'chromium',
+        browser_connection_type: BrowserConnectionType = 'auto',
+        browser_token: Optional[str] = None
 ) -> Union[str, List[str], Path, List[Path]]:
     """
     转换Markdown为知乎格式
 
-    :param markdown: Markdown内容或文件路径
-    :param theme: 主题名称、列表或None（随机）
-    :param output_dir: 输出目录
-    :param return_html: 是否返回HTML内容
-    :param headless: 是否使用无头模式
-    :param wrap_full_html: 是否包装为完整HTML文档
-    :param retry_count: 失败重试次数
-    :param on_error: 错误通知回调函数
-    :param editor_url: 自定义编辑器网址
-    :param image_uploader: 图片上传回调函数，接收图片路径或URL，返回图床URL
-    :param image_upload_mode: 图片上传模式（local=仅本地, remote=仅网络, all=全部）
-    :return: HTML内容或文件路径
+    参数说明同 to_wechat
     """
     return convert(
         markdown=markdown,
@@ -1240,38 +1531,39 @@ def to_zhihu(
         on_error=on_error,
         editor_url=editor_url,
         image_uploader=image_uploader,
-        image_upload_mode=image_upload_mode
+        image_upload_mode=image_upload_mode,
+        code_theme=code_theme,
+        mac_style=mac_style,
+        browser_ws_endpoint=browser_ws_endpoint,
+        browser_type=browser_type,
+        browser_connection_type=browser_connection_type,
+        browser_token=browser_token
     )
 
 
 def to_juejin(
-    markdown: Union[str, Path, List[Union[str, Path]]],
-    theme: Union[str, List[str], None] = 'normal',
-    output_dir: Optional[Union[str, Path]] = None,
-    return_html: bool = True,
-    headless: bool = True,
-    wrap_full_html: bool = False,
-    retry_count: int = 1,
-    on_error: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-    editor_url: Optional[str] = None,
-    image_uploader: Optional[Callable[[str], str]] = None,
-    image_upload_mode: ImageUploadMode = 'local'
+        markdown: Union[str, Path, List[Union[str, Path]]],
+        theme: Union[str, List[str], None] = 'normal',
+        output_dir: Optional[Union[str, Path]] = None,
+        return_html: bool = True,
+        headless: bool = True,
+        wrap_full_html: bool = False,
+        retry_count: int = 1,
+        on_error: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        editor_url: Optional[str] = None,
+        image_uploader: Optional[Callable[[str], str]] = None,
+        image_upload_mode: ImageUploadMode = 'local',
+        code_theme: CodeTheme = 'atom-one-dark',
+        mac_style: bool = True,
+        browser_ws_endpoint: Optional[str] = None,
+        browser_type: BrowserType = 'chromium',
+        browser_connection_type: BrowserConnectionType = 'auto',
+        browser_token: Optional[str] = None
 ) -> Union[str, List[str], Path, List[Path]]:
     """
     转换Markdown为稀土掘金格式
 
-    :param markdown: Markdown内容或文件路径
-    :param theme: 主题名称、列表或None（随机）
-    :param output_dir: 输出目录
-    :param return_html: 是否返回HTML内容
-    :param headless: 是否使用无头模式
-    :param wrap_full_html: 是否包装为完整HTML文档
-    :param retry_count: 失败重试次数
-    :param on_error: 错误通知回调函数
-    :param editor_url: 自定义编辑器网址
-    :param image_uploader: 图片上传回调函数，接收图片路径或URL，返回图床URL
-    :param image_upload_mode: 图片上传模式（local=仅本地, remote=仅网络, all=全部）
-    :return: HTML内容或文件路径
+    参数说明同 to_wechat
     """
     return convert(
         markdown=markdown,
@@ -1285,5 +1577,11 @@ def to_juejin(
         on_error=on_error,
         editor_url=editor_url,
         image_uploader=image_uploader,
-        image_upload_mode=image_upload_mode
+        image_upload_mode=image_upload_mode,
+        code_theme=code_theme,
+        mac_style=mac_style,
+        browser_ws_endpoint=browser_ws_endpoint,
+        browser_type=browser_type,
+        browser_connection_type=browser_connection_type,
+        browser_token=browser_token
     )

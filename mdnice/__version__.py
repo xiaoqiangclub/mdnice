@@ -4,7 +4,7 @@
 # 文件描述：版本信息
 # 文件路径：mdnice/__version__.py
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 __author__ = "xiaoqiang"
 __email__ = "xiaoqiangclub@hotmail.com"
 __license__ = "Apache-2.0"
