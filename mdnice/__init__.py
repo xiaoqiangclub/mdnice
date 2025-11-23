@@ -380,6 +380,7 @@ class MarkdownConverter:
             self.playwright = sync_playwright().start()
 
             if self.browser_ws_endpoint:
+                # ========== 远程浏览器 ==========
                 ws_url = self._build_ws_url_with_token(
                     self.browser_ws_endpoint,
                     self.browser_token
@@ -413,21 +414,24 @@ class MarkdownConverter:
                 else:
                     raise ValueError(f"不支持的连接类型: {connection_type}")
 
-                # 🔧 优化：优先使用现有页面，避免创建冲突
-                if self.browser.contexts:
-                    context = self.browser.contexts[0]
-                    print(f"   使用现有浏览器上下文")
+                # ✅ 远程浏览器的上下文和页面处理
+                context = None
 
-                    # 检查是否已有可用页面
-                    if context.pages:
-                        self.page = context.pages[0]
-                        print(f"   使用现有页面（共 {len(context.pages)} 个页面）")
-                        # 🔧 不要重置页面，直接使用
+                # 检查是否有现有上下文
+                if self.browser.contexts:
+                    existing_context = self.browser.contexts[0]
+
+                    # 如果设置了代理，必须创建新上下文（因为无法修改现有上下文的代理）
+                    if self.proxy:
+                        print(f"   检测到代理配置，需要创建新的浏览器上下文")
+                        context = None  # 强制创建新上下文
                     else:
-                        self.page = context.new_page()
-                        print(f"   在现有上下文中创建新页面")
-                else:
-                    # 创建新上下文时应用代理配置
+                        # 没有代理要求，可以使用现有上下文
+                        context = existing_context
+                        print(f"   使用现有浏览器上下文")
+
+                # 创建新上下文（如果需要）
+                if not context:
                     context_options = {
                         'viewport': {'width': 1920, 'height': 1080},
                         'permissions': ['clipboard-read', 'clipboard-write']
@@ -435,16 +439,24 @@ class MarkdownConverter:
 
                     if self.proxy:
                         context_options['proxy'] = self.proxy
-                        print(f"   应用代理配置: {self.proxy.get('server', 'N/A')}")
+                        print(f"   ✅ 应用代理配置: {self.proxy.get('server', 'N/A')}")
 
                     context = self.browser.new_context(**context_options)
+                    print(f"   创建新浏览器上下文")
+
+                # 获取或创建页面
+                if context.pages:
+                    self.page = context.pages[0]
+                    print(f"   使用现有页面（共 {len(context.pages)} 个页面）")
+                else:
                     self.page = context.new_page()
-                    print(f"   创建新浏览器上下文和页面")
+                    print(f"   创建新页面")
 
             else:
-                # 本地浏览器
+                # ========== 本地浏览器 ==========
                 browser_launcher = getattr(self.playwright, self.browser_type)
 
+                # ✅ 本地浏览器：代理可以在 launch 时设置（全局）
                 launch_args = {
                     'headless': self.headless,
                     'args': [
@@ -454,17 +466,23 @@ class MarkdownConverter:
                     ]
                 }
 
-                # 本地浏览器的代理配置
+                # 方式1：在 launch 时设置代理（全局代理，推荐）
                 if self.proxy:
                     launch_args['proxy'] = self.proxy
-                    print(f"   应用代理配置: {self.proxy.get('server', 'N/A')}")
+                    print(f"   ✅ 应用全局代理: {self.proxy.get('server', 'N/A')}")
 
                 self.browser = browser_launcher.launch(**launch_args)
 
+                # 创建上下文
                 context_options = {
                     'viewport': {'width': 1920, 'height': 1080},
                     'permissions': ['clipboard-read', 'clipboard-write']
                 }
+
+                # 方式2：也可以在 context 时再次设置或覆盖代理
+                # 如果 launch 时已设置代理，这里可以省略
+                # if self.proxy:
+                #     context_options['proxy'] = self.proxy
 
                 context = self.browser.new_context(**context_options)
                 self.page = context.new_page()
@@ -483,6 +501,8 @@ class MarkdownConverter:
                 print("   2. WebSocket 端点是否正确")
                 print("   3. Token 是否有效（如果需要）")
                 print("   4. 网络连接和防火墙设置")
+                if self.proxy:
+                    print("   5. 代理服务器是否可访问")
                 print(f"\n🔧 测试连接：")
 
                 test_url = self.browser_ws_endpoint.replace('ws://', 'http://').replace('wss://', 'https://')
@@ -497,6 +517,8 @@ class MarkdownConverter:
                 print("💡 提示：")
                 print("   1. 确保已安装 Playwright: pip install playwright")
                 print("   2. 首次使用需安装浏览器: playwright install chromium")
+                if self.proxy:
+                    print("   3. 检查代理服务器配置是否正确")
 
             self._notify_error(
                 error_msg, {'stage': '初始化浏览器', 'error_type': type(e).__name__})
