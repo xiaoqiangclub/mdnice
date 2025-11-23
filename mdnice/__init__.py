@@ -678,10 +678,6 @@ class MarkdownConverter:
         :param enable: 是否启用 Mac 风格
         """
         try:
-            # 检查页面有效性
-            if not self._is_page_valid():
-                raise ConversionError("页面已失效，无法设置 Mac 风格")
-
             code_theme_button = self.page.locator('#nice-menu-codetheme')
             code_theme_button.wait_for(state='visible', timeout=self.wait_timeout)
             code_theme_button.click()
@@ -690,32 +686,48 @@ class MarkdownConverter:
             mac_style_button = self.page.locator('#nice-menu-codetheme-apple')
             mac_style_button.wait_for(state='visible', timeout=self.wait_timeout)
 
+            # ✅ 更健壮的选中状态判断
             is_selected = self.page.evaluate("""
                 () => {
-                    const element = document.querySelector('#nice-menu-codetheme-apple');
-                    if (!element) return false;
+                    const macItem = document.querySelector('#nice-menu-codetheme-apple');
+                    if (!macItem) return false;
 
-                    const classList = element.className;
-                    const style = window.getComputedStyle(element);
+                    // 方法1：检查 flag 内是否有 ✔️
+                    const flagElement = macItem.querySelector('.nice-codetheme-item-flag');
+                    if (flagElement) {
+                        const hasCheckmark = flagElement.innerHTML.trim().length > 0;
+                        if (hasCheckmark) return true;
+                    }
 
-                    return classList.includes('selected') || 
-                           classList.includes('active') ||
-                           classList.includes('checked') ||
-                           element.getAttribute('aria-checked') === 'true' ||
-                           style.backgroundColor !== 'rgba(0, 0, 0, 0)';
+                    // 方法2：检查是否有 'selected' 或 'active' 类名
+                    if (macItem.classList.contains('selected') || 
+                        macItem.classList.contains('active') ||
+                        macItem.classList.contains('checked')) {
+                        return true;
+                    }
+
+                    // 方法3：检查 aria-checked 属性
+                    if (macItem.getAttribute('aria-checked') === 'true') {
+                        return true;
+                    }
+
+                    return false;
                 }
             """)
 
+            # 只有当期望状态与当前状态不一致时才点击
             should_click = (enable and not is_selected) or (not enable and is_selected)
 
             if should_click:
                 mac_style_button.click()
                 action = '启用' if enable else '禁用'
-                print(f"🍎 已{action} Mac 风格")
+                print(f"🍎 已{action} Mac 风格（从 {'选中' if is_selected else '未选中'} 切换）")
+                time.sleep(0.3)  # 给一点时间让动画完成
             else:
                 status = '已启用' if enable else '已禁用'
-                print(f"🍎 Mac 风格{status}（无需切换）")
+                print(f"🍎 Mac 风格{status}（当前状态: {'选中' if is_selected else '未选中'}，无需切换）")
 
+            # 点击其他地方关闭菜单
             self.page.evaluate("() => document.body.click()")
             time.sleep(0.5)
 
